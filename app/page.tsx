@@ -1,184 +1,333 @@
+// app/page.tsx
 'use client';
 
-import React, { useEffect, useState } from 'react';
-import { createClient } from '@supabase/supabase-js';
+import React, { useState, useEffect } from 'react';
+import { supabase } from '@/lib/supabase';
 
-// Supabase 클라이언트 설정 (환경 변수 또는 기본값 사용)
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://your-supabase-url.supabase.co';
-const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || 'your-anon-key';
-const supabase = createClient(supabaseUrl, supabaseAnonKey);
+export default function AdminDashboard() {
+  const [currentTab, setCurrentTab] = useState<'pipeline' | 'pricing' | 'users' | 'stocks' | 'system'>('pipeline');
+  const [loading, setLoading] = useState(false);
 
-interface StockData {
-  id?: number;
-  ticker: string;
-  name?: string;
-  price?: number;
-  momentum_score?: number;
-  updated_at?: string;
-}
+  // DB Data States
+  const [pipelineLogs, setPipelineLogs] = useState<any[]>([]);
+  const [pricingParams, setPricingParams] = useState({ view_weight: '0.4', like_weight: '0.3', chart_weight: '0.3' });
+  const [users, setUsers] = useState<any[]>([]);
+  const [stocks, setStocks] = useState<any[]>([]);
+  const [pushTitle, setPushTitle] = useState('');
+  const [pushBody, setPushBody] = useState('');
 
-export default function HomePage() {
-  const [stocks, setStocks] = useState<StockData[]>([]);
-  const [loading, setLoading] = useState<boolean>(true);
-  const [searchQuery, setSearchQuery] = useState<string>('');
-  const [filter, setFilter] = useState<'all' | 'high_score'>('all');
+  useEffect(() => {
+    fetchInitialData();
+  }, []);
 
-  // Supabase 데이터 가져오기
-  const fetchStockData = async () => {
+  const fetchInitialData = async () => {
     setLoading(true);
-    try {
-      let query = supabase.from('stocks').select('*');
+    await Promise.all([
+      fetchPipelineData(),
+      fetchUsers(),
+      fetchStocks()
+    ]);
+    setLoading(false);
+  };
 
-      if (filter === 'high_score') {
-        query = query.gte('momentum_score', 70); // 모멘텀 점수 70점 이상
-      }
+  // 1. Pipeline Operations (collector.py)
+  const fetchPipelineData = async () => {
+    const { data: logs } = await supabase.from('pipeline_logs').select('*').order('created_at', { ascending: false }).limit(10);
+    if (logs) setPipelineLogs(logs);
+  };
 
-      const { data, error } = await query.order('momentum_score', { ascending: false });
+  const triggerManualCollector = async () => {
+    setLoading(true);
+    const { error } = await supabase.functions.invoke('trigger-collector');
+    setLoading(false);
+    if (error) alert(`수집 트리거 실패: ${error.message}`);
+    else alert('⚡ collector.py 데이터 수집 작업이 성공적으로 시작되었습니다.');
+  };
 
-      if (error) {
-        console.error('Supabase fetch error:', error);
-        // DB 연결 실패 시 샘플 데이터 제공 (화면 확인용)
-        setStocks([
-          { ticker: 'AAPL', name: 'Apple Inc.', price: 224.23, momentum_score: 88, updated_at: new Date().toISOString() },
-          { ticker: 'NVDA', name: 'NVIDIA Corp.', price: 128.15, momentum_score: 95, updated_at: new Date().toISOString() },
-          { ticker: 'MSFT', name: 'Microsoft Corp.', price: 448.30, momentum_score: 82, updated_at: new Date().toISOString() },
-          { ticker: 'TSLA', name: 'Tesla Inc.', price: 254.11, momentum_score: 64, updated_at: new Date().toISOString() },
-        ]);
-      } else if (data && data.length > 0) {
-        setStocks(data);
-      } else {
-        // 데이터가 없을 경우
-        setStocks([]);
-      }
-    } catch (err) {
-      console.error('Data loading error:', err);
-    } finally {
-      setLoading(false);
+  // 2. Pricing Engine Controls (pricing_engine.py)
+  const savePricingParameters = async () => {
+    const { error } = await supabase.from('system_config').upsert({ id: 'pricing_weights', value: pricingParams });
+    if (error) alert(`설정 저장 실패: ${error.message}`);
+    else alert('가치 산정 알고리즘 가중치가 적용되었습니다.');
+  };
+
+  const overrideStockPrice = async (stockId: string) => {
+    const newPrice = prompt('새로운 수동 조정 주가를 입력하세요 (KRW):');
+    if (!newPrice) return;
+    
+    const { error } = await supabase.from('stocks').update({ price: parseFloat(newPrice), is_overridden: true }).eq('id', stockId);
+    if (error) alert(`보정 실패: ${error.message}`);
+    else {
+      alert('주가가 성공적으로 보정되었습니다.');
+      fetchStocks();
     }
   };
 
-  useEffect(() => {
-    fetchStockData();
-  }, [filter]);
+  // 3. User & Corporation Balance
+  const fetchUsers = async () => {
+    const { data } = await supabase.from('users').select('*');
+    if (data) setUsers(data);
+  };
 
-  // 검색 필터링
-  const filteredStocks = stocks.filter((s) =>
-    s.ticker.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    (s.name && s.name.toLowerCase().includes(searchQuery.toLowerCase()))
-  );
+  const grantSeedMoney = async (userId: string, amount: number) => {
+    const { error } = await supabase.rpc('add_user_balance', { user_id: userId, amount_to_add: amount });
+    if (error) alert(`시드머니 지급 실패: ${error.message}`);
+    else {
+      alert(`${amount.toLocaleString()} KRW 시드머니가 지급되었습니다.`);
+      fetchUsers();
+    }
+  };
+
+  // 4. Stock & Lockup Control (D-7 Lockup)
+  const fetchStocks = async () => {
+    const { data } = await supabase.from('stocks').select('*');
+    if (data) setStocks(data);
+  };
+
+  const toggleLockup = async (stockId: string, currentStatus: boolean) => {
+    const { error } = await supabase.from('stocks').update({ lockup_active: !currentStatus }).eq('id', stockId);
+    if (error) alert(`락업 변경 실패: ${error.message}`);
+    else fetchStocks();
+  };
+
+  // 5. System Broadcast & Push Notification
+  const sendPushNotification = async () => {
+    if (!pushTitle || !pushBody) return alert('제목과 내용을 모두 입력하세요.');
+    const { error } = await supabase.from('notifications').insert([{ title: pushTitle, body: pushBody, target: 'ALL' }]);
+    if (error) alert(`발송 실패: ${error.message}`);
+    else {
+      alert('📢 전체 사용자 푸시 알림이 발송되었습니다.');
+      setPushTitle(''); setPushBody('');
+    }
+  };
 
   return (
-    <main className="min-h-screen bg-gray-900 text-white p-6 font-sans">
-      {/* 헤더 영역 */}
-      <header className="max-w-6xl mx-auto mb-8 flex flex-col md:flex-row justify-between items-center gap-4">
+    <div className="flex h-screen bg-slate-100 text-slate-800">
+      {/* Sidebar Navigation */}
+      <aside className="w-64 bg-slate-900 text-white p-6 flex flex-col justify-between">
         <div>
-          <h1 className="text-3xl font-extrabold text-indigo-400">Momentum Pricing Dashboard</h1>
-          <p className="text-gray-400 text-sm mt-1">
-            파이프라인 분석 데이터 및 모멘텀 기반 주식 트래킹 시스템
-          </p>
+          <h1 className="text-xl font-bold text-sky-400 mb-8">SoundStock Executive</h1>
+          <nav className="space-y-2">
+            <button
+              onClick={() => setCurrentTab('pipeline')}
+              className={`w-full text-left px-4 py-3 rounded-lg font-medium transition ${currentTab === 'pipeline' ? 'bg-slate-800 text-sky-400' : 'text-slate-400 hover:bg-slate-800'}`}
+            >
+              🔄 파이프라인/수집
+            </button>
+            <button
+              onClick={() => setCurrentTab('pricing')}
+              className={`w-full text-left px-4 py-3 rounded-lg font-medium transition ${currentTab === 'pricing' ? 'bg-slate-800 text-sky-400' : 'text-slate-400 hover:bg-slate-800'}`}
+            >
+              📈 가격 엔진 제어
+            </button>
+            <button
+              onClick={() => setCurrentTab('users')}
+              className={`w-full text-left px-4 py-3 rounded-lg font-medium transition ${currentTab === 'users' ? 'bg-slate-800 text-sky-400' : 'text-slate-400 hover:bg-slate-800'}`}
+            >
+              👥 주식회사(유저) 관리
+            </button>
+            <button
+              onClick={() => setCurrentTab('stocks')}
+              className={`w-full text-left px-4 py-3 rounded-lg font-medium transition ${currentTab === 'stocks' ? 'bg-slate-800 text-sky-400' : 'text-slate-400 hover:bg-slate-800'}`}
+            >
+              🎵 종목 & 락업(D-7)
+            </button>
+            <button
+              onClick={() => setCurrentTab('system')}
+              className={`w-full text-left px-4 py-3 rounded-lg font-medium transition ${currentTab === 'system' ? 'bg-slate-800 text-sky-400' : 'text-slate-400 hover:bg-slate-800'}`}
+            >
+              📢 공지 & 푸시 알림
+            </button>
+          </nav>
         </div>
         <button
-          onClick={fetchStockData}
-          className="bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded-lg font-medium transition duration-200"
+          onClick={fetchInitialData}
+          className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-lg transition"
         >
-          🔄 데이터 새로고침
+          🔄 Live DB 동기화
         </button>
-      </header>
+      </aside>
 
-      {/* 필터 및 검색 컨트롤 */}
-      <section className="max-w-6xl mx-auto mb-6 flex flex-col sm:flex-row gap-4 justify-between items-center">
-        <input
-          type="text"
-          placeholder="티커 또는 종목명 검색..."
-          value={searchQuery}
-          onChange={(e) => setSearchQuery(e.target.value)}
-          className="w-full sm:w-80 px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white focus:outline-none focus:border-indigo-500"
-        />
-
-        <div className="flex gap-2">
-          <button
-            onClick={() => setFilter('all')}
-            className={`px-4 py-2 rounded-lg font-medium text-sm ${
-              filter === 'all'
-                ? 'bg-indigo-600 text-white'
-                : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
-            }`}
-          >
-            전체 보기
-          </button>
-          <button
-            onClick={() => setFilter('high_score')}
-            className={`px-4 py-2 rounded-lg font-medium text-sm ${
-              filter === 'high_score'
-                ? 'bg-indigo-600 text-white'
-                : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
-            }`}
-          >
-            🔥 고모멘텀 (70점 이상)
-          </button>
-        </div>
-      </section>
-
-      {/* 데이터 리스트 / 테이블 */}
-      <section className="max-w-6xl mx-auto bg-gray-800 rounded-xl overflow-hidden shadow-lg border border-gray-700">
+      {/* Main Content Area */}
+      <main className="flex-1 p-8 overflow-y-auto">
         {loading ? (
-          <div className="p-12 text-center text-gray-400">
-            <p className="animate-pulse"> 데이터를 불러오는 중입니다...</p>
-          </div>
-        ) : filteredStocks.length === 0 ? (
-          <div className="p-12 text-center text-gray-400">
-            조회된 데이터가 없습니다.
+          <div className="flex justify-center items-center h-full">
+            <div className="text-lg font-semibold text-blue-600 animate-pulse">Supabase 데이터 동기화 중...</div>
           </div>
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse">
-              <thead>
-                <tr className="bg-gray-700/50 text-gray-300 text-sm border-b border-gray-700">
-                  <th className="p-4">티커 (Ticker)</th>
-                  <th className="p-4">종목명</th>
-                  <th className="p-4">현재가 ($)</th>
-                  <th className="p-4">모멘텀 점수</th>
-                  <th className="p-4">업데이트 일시</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-gray-700 text-sm">
-                {filteredStocks.map((item, index) => (
-                  <tr key={index} className="hover:bg-gray-700/30 transition">
-                    <td className="p-4 font-bold text-indigo-300">{item.ticker}</td>
-                    <td className="p-4 text-gray-200">{item.name || '-'}</td>
-                    <td className="p-4 text-gray-100 font-mono">
-                      {item.price ? `$${item.price.toFixed(2)}` : '-'}
-                    </td>
-                    <td className="p-4">
-                      <span
-                        className={`px-2.5 py-1 rounded-full text-xs font-semibold ${
-                          (item.momentum_score || 0) >= 80
-                            ? 'bg-green-500/20 text-green-400 border border-green-500/30'
-                            : (item.momentum_score || 0) >= 50
-                            ? 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/30'
-                            : 'bg-red-500/20 text-red-400 border border-red-500/30'
-                        }`}
-                      >
-                        {item.momentum_score ?? 'N/A'} 점
-                      </span>
-                    </td>
-                    <td className="p-4 text-gray-400 text-xs">
-                      {item.updated_at
-                        ? new Date(item.updated_at).toLocaleString('ko-KR')
-                        : '-'}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </section>
+          <>
+            {/* Tab 1: Pipeline Operations */}
+            {currentTab === 'pipeline' && (
+              <div className="space-y-6">
+                <h2 className="text-2xl font-bold">데이터 수집 및 파이프라인 Operations</h2>
+                <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+                  <h3 className="text-lg font-bold mb-4">수동 수집 실행 (Manual Trigger)</h3>
+                  <button
+                    onClick={triggerManualCollector}
+                    className="bg-blue-600 hover:bg-blue-700 text-white font-bold px-5 py-2.5 rounded-lg transition"
+                  >
+                    ⚡ 즉시 collector.py 수집 실행
+                  </button>
+                </div>
+                <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+                  <h3 className="text-lg font-bold mb-4">최근 파이프라인 실행 로그</h3>
+                  <div className="space-y-3">
+                    {pipelineLogs.map((log) => (
+                      <div key={log.id} className="p-4 bg-slate-50 border rounded-lg flex justify-between items-center">
+                        <div>
+                          <span className={`inline-block px-2 py-1 text-xs font-bold rounded mr-3 ${log.status === 'SUCCESS' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
+                            {log.status || 'INFO'}
+                          </span>
+                          <span className="text-sm font-medium text-slate-700">{log.message || '데이터 수집 완료'}</span>
+                        </div>
+                        <span className="text-xs text-slate-400">{new Date(log.created_at).toLocaleString()}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
 
-      {/* 푸터 */}
-      <footer className="max-w-6xl mx-auto mt-12 text-center text-gray-500 text-xs">
-        © {new Date().getFullYear()} Momentum Pricing System. Powered by Next.js & Supabase.
-      </footer>
-    </main>
+            {/* Tab 2: Pricing Engine Control */}
+            {currentTab === 'pricing' && (
+              <div className="space-y-6">
+                <h2 className="text-2xl font-bold">가치 산정 알고리즘 제어 (pricing_engine.py)</h2>
+                <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 space-y-4 max-w-xl">
+                  <h3 className="text-lg font-bold">가중치 변수 수정</h3>
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-500 mb-1">조회수 가중치 (View Weight)</label>
+                    <input
+                      type="text"
+                      className="w-full border p-2 rounded-lg"
+                      value={pricingParams.view_weight}
+                      onChange={(e) => setPricingParams({ ...pricingParams, view_weight: e.target.value })}
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-500 mb-1">좋아요 가중치 (Like Weight)</label>
+                    <input
+                      type="text"
+                      className="w-full border p-2 rounded-lg"
+                      value={pricingParams.like_weight}
+                      onChange={(e) => setPricingParams({ ...pricingParams, like_weight: e.target.value })}
+                    />
+                  </div>
+                  <button
+                    onClick={savePricingParameters}
+                    className="bg-blue-600 hover:bg-blue-700 text-white font-bold px-4 py-2 rounded-lg transition"
+                  >
+                    파라미터 적용
+                  </button>
+                </div>
+
+                <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+                  <h3 className="text-lg font-bold mb-4">이상치 종목 가격 수동 보정 (Override)</h3>
+                  <div className="divide-y">
+                    {stocks.map((stock) => (
+                      <div key={stock.id} className="py-3 flex justify-between items-center">
+                        <div>
+                          <p className="font-bold">{stock.title}</p>
+                          <p className="text-xs text-slate-500">{stock.artist} | 현재가: ₩{stock.price?.toLocaleString()}</p>
+                        </div>
+                        <button
+                          onClick={() => overrideStockPrice(stock.id)}
+                          className="bg-amber-500 hover:bg-amber-600 text-white font-semibold text-xs px-3 py-1.5 rounded transition"
+                        >
+                          가격 수동 수정
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Tab 3: User & Corporation Management */}
+            {currentTab === 'users' && (
+              <div className="space-y-6">
+                <h2 className="text-2xl font-bold">주식회사(사용자) 현황 및 예수금 제어</h2>
+                <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+                  <div className="divide-y">
+                    {users.map((user) => (
+                      <div key={user.id} className="py-4 flex justify-between items-center">
+                        <div>
+                          <p className="font-bold text-base">{user.company_name || user.name || '무명 주식회사'}</p>
+                          <p className="text-xs text-slate-500">{user.email} | 보유 현금: ₩{user.balance?.toLocaleString() || 0}</p>
+                        </div>
+                        <button
+                          onClick={() => grantSeedMoney(user.id, 1000000)}
+                          className="bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-xs px-3 py-2 rounded-lg transition"
+                        >
+                          +1,000,000 KRW 지급
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Tab 4: Stocks & Lockup Management */}
+            {currentTab === 'stocks' && (
+              <div className="space-y-6">
+                <h2 className="text-2xl font-bold">상장 종목 & 매도 락업(D-7) 제어</h2>
+                <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+                  <div className="divide-y">
+                    {stocks.map((stock) => (
+                      <div key={stock.id} className="py-4 flex justify-between items-center">
+                        <div>
+                          <p className="font-bold">{stock.title}</p>
+                          <p className="text-xs text-slate-500">{stock.artist} | 락업 상태: {stock.lockup_active ? '🔒 락업 중 (매도 제한)' : '🔓 해제됨'}</p>
+                        </div>
+                        <button
+                          onClick={() => toggleLockup(stock.id, stock.lockup_active)}
+                          className={`text-xs font-semibold px-3 py-1.5 rounded transition ${stock.lockup_active ? 'bg-red-500 hover:bg-red-600 text-white' : 'bg-slate-200 hover:bg-slate-300 text-slate-700'}`}
+                        >
+                          {stock.lockup_active ? '락업 해제' : '락업 설정'}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Tab 5: Broadcast & Notifications */}
+            {currentTab === 'system' && (
+              <div className="space-y-6">
+                <h2 className="text-2xl font-bold">시스템 공지 및 푸시 알림 발송</h2>
+                <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 max-w-xl space-y-4">
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-500 mb-1">알림 제목</label>
+                    <input
+                      type="text"
+                      className="w-full border p-2 rounded-lg"
+                      placeholder="예: 신규 음악 주식 상장 안내"
+                      value={pushTitle}
+                      onChange={(e) => setPushTitle(e.target.value)}
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-500 mb-1">알림 내용</label>
+                    <textarea
+                      className="w-full border p-2 rounded-lg h-24"
+                      placeholder="앱 사용자 전체에게 전달할 메시지를 입력하세요."
+                      value={pushBody}
+                      onChange={(e) => setPushBody(e.target.value)}
+                    />
+                  </div>
+                  <button
+                    onClick={sendPushNotification}
+                    className="bg-blue-600 hover:bg-blue-700 text-white font-bold px-5 py-2.5 rounded-lg transition"
+                  >
+                    전체 푸시 알림 발송
+                  </button>
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </main>
+    </div>
   );
 }
